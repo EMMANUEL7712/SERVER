@@ -1,0 +1,28 @@
+databases:
+  - name: se-paris-db
+    plan: free
+
+services:
+  - type: web
+    name: se-paris-paiement
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: ADRESSE_SITE
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: se-paris-db
+          property: connectionString
