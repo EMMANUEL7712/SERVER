@@ -2,8 +2,8 @@
 // SERVEUR — SE Paris
 // Gère : 1) le paiement Stripe   2) le catalogue produits (base
 // de données PostgreSQL)   3) l'espace administrateur (photos
-// stockées de façon permanente sur Cloudinary)   4) la gestion
-// des stocks (article épuisé, quantité limitée)
+// stockées de façon permanente sur Cloudinary, jusqu'à 4 par article)
+// 4) la gestion des stocks (article épuisé, quantité limitée)
 // ============================================================
 
 const express = require('express');
@@ -43,12 +43,14 @@ async function initialiserBaseDeDonnees() {
       genre TEXT DEFAULT '',
       photo TEXT DEFAULT '',
       photo_id TEXT DEFAULT '',
+      photos TEXT DEFAULT '[]',
       stock INTEGER DEFAULT 1,
       cree_le TIMESTAMP DEFAULT NOW()
     );
   `);
   await pool.query(`ALTER TABLE produits ADD COLUMN IF NOT EXISTS stock INTEGER DEFAULT 1;`);
-  console.log('Base de données prête (table "produits", avec gestion du stock).');
+  await pool.query(`ALTER TABLE produits ADD COLUMN IF NOT EXISTS photos TEXT DEFAULT '[]';`);
+  console.log('Base de données prête (table "produits", avec gestion du stock et photos multiples).');
 }
 
 cloudinary.config({
@@ -90,6 +92,10 @@ app.get('/produits', async (req, res) => {
     const catalogue = { vetements: [], chaussures: [], accessoires: [] };
     resultat.rows.forEach(ligne => {
       if (!catalogue[ligne.module]) return;
+      let listePhotos = [];
+      try { listePhotos = JSON.parse(ligne.photos || '[]').map(p => p.url); } catch(e) { listePhotos = []; }
+      if (listePhotos.length === 0 && ligne.photo) listePhotos = [ligne.photo];
+
       catalogue[ligne.module].push({
         id: ligne.id,
         nom: ligne.nom,
@@ -100,7 +106,8 @@ app.get('/produits', async (req, res) => {
         ancien: parseFloat(ligne.ancien) || 0,
         cat: ligne.cat,
         genre: ligne.genre,
-        photo: ligne.photo,
+        photo: listePhotos[0] || '',
+        photos: listePhotos,
         stock: ligne.stock === null || ligne.stock === undefined ? 1 : parseInt(ligne.stock, 10),
         date: 0
       });
@@ -120,7 +127,7 @@ app.post('/admin/connexion', (req, res) => {
   }
 });
 
-app.post('/admin/produits', verifierMotDePasse, upload.single('photo'), async (req, res) => {
+app.post('/admin/produits', verifierMotDePasse, upload.array('photos', 4), async (req, res) => {
   try {
     const { module, nom, marque, taille, etat, prix, ancienPrix, cat, genre, stock } = req.body;
 
@@ -131,27 +138,29 @@ app.post('/admin/produits', verifierMotDePasse, upload.single('photo'), async (r
       return res.status(400).json({ erreur: 'Nom et prix sont obligatoires.' });
     }
 
-    let urlPhoto = '';
-    let idPhoto = '';
-    if (req.file) {
-      const resultatUpload = await televerserVersCloudinary(req.file.buffer);
-      urlPhoto = resultatUpload.secure_url;
-      idPhoto = resultatUpload.public_id;
+    let listePhotos = [];
+    if (req.files && req.files.length > 0) {
+      for (const fichier of req.files.slice(0, 4)) {
+        const resultatUpload = await televerserVersCloudinary(fichier.buffer);
+        listePhotos.push({ url: resultatUpload.secure_url, public_id: resultatUpload.public_id });
+      }
     }
+    const urlPhoto = listePhotos[0] ? listePhotos[0].url : '';
+    const idPhoto = listePhotos[0] ? listePhotos[0].public_id : '';
 
     const stockInitial = stock !== undefined && stock !== '' ? Math.max(0, parseInt(stock, 10)) : 1;
 
     const id = module[0] + Date.now();
     await pool.query(
-      `INSERT INTO produits (id, module, nom, marque, taille, etat, prix, ancien, cat, genre, photo, photo_id, stock)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      `INSERT INTO produits (id, module, nom, marque, taille, etat, prix, ancien, cat, genre, photo, photo_id, photos, stock)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
       [id, module, nom, marque || '', taille || 'Taille unique', etat || 'Bon état',
-       parseFloat(prix), ancienPrix ? parseFloat(ancienPrix) : 0, cat || '', genre || '', urlPhoto, idPhoto, stockInitial]
+       parseFloat(prix), ancienPrix ? parseFloat(ancienPrix) : 0, cat || '', genre || '', urlPhoto, idPhoto, JSON.stringify(listePhotos), stockInitial]
     );
 
     res.json({
       succes: true,
-      produit: { id, nom, marque, taille, etat, prix: parseFloat(prix), ancien: ancienPrix ? parseFloat(ancienPrix) : 0, cat, genre, photo: urlPhoto, stock: stockInitial }
+      produit: { id, nom, marque, taille, etat, prix: parseFloat(prix), ancien: ancienPrix ? parseFloat(ancienPrix) : 0, cat, genre, photo: urlPhoto, photos: listePhotos.map(p=>p.url), stock: stockInitial }
     });
   } catch (err) {
     console.error(err);
@@ -175,12 +184,21 @@ app.patch('/admin/produits/:id/stock', verifierMotDePasse, async (req, res) => {
 });
 
 app.delete('/admin/produits/:module/:id', verifierMotDePasse, async (req, res) => {
-  const { module, id } = req.params;
-  const donnees = await pool.query('SELECT photo_id FROM produits WHERE id = $1', [id]);
-  await pool.query('DELETE FROM produits WHERE id = $1', [id]);
-  const idPhoto = donnees.rows[0] && donnees.rows[0].photo_id;
-  if (idPhoto) cloudinary.uploader.destroy(idPhoto, () => {});
-  res.json({ succes: true });
+  try {
+    const { id } = req.params;
+    const existant = await pool.query('SELECT photos FROM produits WHERE id = $1', [id]);
+    await pool.query('DELETE FROM produits WHERE id = $1', [id]);
+
+    let listePhotos = [];
+    try { listePhotos = JSON.parse((existant.rows[0] && existant.rows[0].photos) || '[]'); } catch(e) {}
+    listePhotos.forEach(p => {
+      if (p.public_id) cloudinary.uploader.destroy(p.public_id, () => {});
+    });
+    res.json({ succes: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erreur: 'Erreur lors de la suppression.' });
+  }
 });
 
 app.post('/create-checkout-session', async (req, res) => {
