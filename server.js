@@ -2,13 +2,8 @@
 // SERVEUR — SE Paris
 // Gère : 1) le paiement Stripe   2) le catalogue produits (base
 // de données PostgreSQL)   3) l'espace administrateur (photos
-// stockées de façon permanente sur Cloudinary)
-// ============================================================
-// La clé secrète Stripe, le mot de passe admin, et les identifiants
-// de la base de données restent ici, côté serveur, JAMAIS visibles
-// par les visiteurs du site.
-// Voir GUIDE-PAIEMENT.md, GUIDE-ADMIN.md et GUIDE-BASE-DE-DONNEES.md
-// pour la marche à suivre complète.
+// stockées de façon permanente sur Cloudinary)   4) la gestion
+// des stocks (article épuisé, quantité limitée)
 // ============================================================
 
 const express = require('express');
@@ -26,7 +21,6 @@ const MOT_DE_PASSE_ADMIN = process.env.ADMIN_PASSWORD || '120469';
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ---------- Base de données PostgreSQL ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost')
@@ -49,24 +43,23 @@ async function initialiserBaseDeDonnees() {
       genre TEXT DEFAULT '',
       photo TEXT DEFAULT '',
       photo_id TEXT DEFAULT '',
+      stock INTEGER DEFAULT 1,
       cree_le TIMESTAMP DEFAULT NOW()
     );
   `);
-  console.log('Base de données prête (table "produits").');
+  await pool.query(`ALTER TABLE produits ADD COLUMN IF NOT EXISTS stock INTEGER DEFAULT 1;`);
+  console.log('Base de données prête (table "produits", avec gestion du stock).');
 }
 
-// ---------- Stockage des photos (Cloudinary, permanent) ----------
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Fichiers reçus en mémoire (pas sur le disque du serveur), puis envoyés
-// directement vers Cloudinary : rien n'est perdu lors d'un redéploiement.
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5 Mo max
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (/^image\/(jpeg|png|webp|gif)$/.test(file.mimetype)) cb(null, true);
     else cb(new Error('Seules les images (jpg, png, webp, gif) sont acceptées.'));
@@ -83,7 +76,6 @@ function televerserVersCloudinary(buffer) {
   });
 }
 
-// ---------- Protection de l'espace admin ----------
 function verifierMotDePasse(req, res, next) {
   const motDePasse = req.header('x-admin-password');
   if (motDePasse !== MOT_DE_PASSE_ADMIN) {
@@ -92,7 +84,6 @@ function verifierMotDePasse(req, res, next) {
   next();
 }
 
-// ---------- Routes publiques : catalogue ----------
 app.get('/produits', async (req, res) => {
   try {
     const resultat = await pool.query('SELECT * FROM produits ORDER BY cree_le DESC');
@@ -110,6 +101,7 @@ app.get('/produits', async (req, res) => {
         cat: ligne.cat,
         genre: ligne.genre,
         photo: ligne.photo,
+        stock: ligne.stock === null || ligne.stock === undefined ? 1 : parseInt(ligne.stock, 10),
         date: 0
       });
     });
@@ -120,7 +112,6 @@ app.get('/produits', async (req, res) => {
   }
 });
 
-// ---------- Routes admin : connexion ----------
 app.post('/admin/connexion', (req, res) => {
   if (req.body.motDePasse === MOT_DE_PASSE_ADMIN) {
     res.json({ succes: true });
@@ -129,10 +120,9 @@ app.post('/admin/connexion', (req, res) => {
   }
 });
 
-// ---------- Routes admin : ajouter un produit (avec photo) ----------
 app.post('/admin/produits', verifierMotDePasse, upload.single('photo'), async (req, res) => {
   try {
-    const { module, nom, marque, taille, etat, prix, ancienPrix, cat, genre } = req.body;
+    const { module, nom, marque, taille, etat, prix, ancienPrix, cat, genre, stock } = req.body;
 
     if (!['vetements', 'chaussures', 'accessoires'].includes(module)) {
       return res.status(400).json({ erreur: 'Module invalide.' });
@@ -149,17 +139,19 @@ app.post('/admin/produits', verifierMotDePasse, upload.single('photo'), async (r
       idPhoto = resultatUpload.public_id;
     }
 
+    const stockInitial = stock !== undefined && stock !== '' ? Math.max(0, parseInt(stock, 10)) : 1;
+
     const id = module[0] + Date.now();
     await pool.query(
-      `INSERT INTO produits (id, module, nom, marque, taille, etat, prix, ancien, cat, genre, photo, photo_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      `INSERT INTO produits (id, module, nom, marque, taille, etat, prix, ancien, cat, genre, photo, photo_id, stock)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [id, module, nom, marque || '', taille || 'Taille unique', etat || 'Bon état',
-       parseFloat(prix), ancienPrix ? parseFloat(ancienPrix) : 0, cat || '', genre || '', urlPhoto, idPhoto]
+       parseFloat(prix), ancienPrix ? parseFloat(ancienPrix) : 0, cat || '', genre || '', urlPhoto, idPhoto, stockInitial]
     );
 
     res.json({
       succes: true,
-      produit: { id, nom, marque, taille, etat, prix: parseFloat(prix), ancien: ancienPrix ? parseFloat(ancienPrix) : 0, cat, genre, photo: urlPhoto }
+      produit: { id, nom, marque, taille, etat, prix: parseFloat(prix), ancien: ancienPrix ? parseFloat(ancienPrix) : 0, cat, genre, photo: urlPhoto, stock: stockInitial }
     });
   } catch (err) {
     console.error(err);
@@ -167,31 +159,77 @@ app.post('/admin/produits', verifierMotDePasse, upload.single('photo'), async (r
   }
 });
 
-// ---------- Routes admin : supprimer un produit ----------
-app.delete('/admin/produits/:module/:id', verifierMotDePasse, async (req, res) => {
+app.patch('/admin/produits/:id/stock', verifierMotDePasse, async (req, res) => {
   try {
     const { id } = req.params;
-    const existant = await pool.query('SELECT photo_id FROM produits WHERE id = $1', [id]);
-    await pool.query('DELETE FROM produits WHERE id = $1', [id]);
-
-    const idPhoto = existant.rows[0] && existant.rows[0].photo_id;
-    if (idPhoto) {
-      cloudinary.uploader.destroy(idPhoto, () => {});
+    const { stock } = req.body;
+    if (stock === undefined || isNaN(parseInt(stock, 10))) {
+      return res.status(400).json({ erreur: 'Stock invalide.' });
     }
+    await pool.query('UPDATE produits SET stock = $1 WHERE id = $2', [Math.max(0, parseInt(stock, 10)), id]);
     res.json({ succes: true });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ erreur: 'Erreur lors de la suppression.' });
+    res.status(500).json({ erreur: 'Erreur lors de la mise à jour du stock.' });
   }
 });
 
-// ---------- Paiement Stripe ----------
+app.delete('/admin/produits/:module/:id', verifierMotDePasse, async (req, res) => {
+  const { module, id } = req.params;
+  const donnees = await pool.query('SELECT photo_id FROM produits WHERE id = $1', [id]);
+  await pool.query('DELETE FROM produits WHERE id = $1', [id]);
+  const idPhoto = donnees.rows[0] && donnees.rows[0].photo_id;
+  if (idPhoto) cloudinary.uploader.destroy(idPhoto, () => {});
+  res.json({ succes: true });
+});
+
 app.post('/create-checkout-session', async (req, res) => {
+  const client = await pool.connect();
   try {
     const { articles } = req.body;
     if (!Array.isArray(articles) || articles.length === 0) {
+      client.release();
       return res.status(400).json({ erreur: 'Panier vide ou invalide.' });
     }
+
+    await client.query('BEGIN');
+    const articlesEnRupture = [];
+
+    for (const article of articles) {
+      if (!article.id) continue;
+      const quantiteVoulue = Math.max(1, parseInt(article.quantite, 10) || 1);
+      const resultat = await client.query('SELECT stock, nom FROM produits WHERE id = $1 FOR UPDATE', [article.id]);
+
+      if (resultat.rows.length === 0) {
+        articlesEnRupture.push(article.nom);
+        continue;
+      }
+      const stockActuel = parseInt(resultat.rows[0].stock, 10);
+      if (stockActuel < quantiteVoulue) {
+        articlesEnRupture.push(resultat.rows[0].nom);
+        continue;
+      }
+    }
+
+    if (articlesEnRupture.length > 0) {
+      await client.query('ROLLBACK');
+      client.release();
+      return res.status(409).json({
+        erreur: 'stock_insuffisant',
+        message: `Ces articles ne sont plus disponibles en quantité suffisante : ${articlesEnRupture.join(', ')}.`,
+        articles: articlesEnRupture
+      });
+    }
+
+    for (const article of articles) {
+      if (!article.id) continue;
+      const quantiteVoulue = Math.max(1, parseInt(article.quantite, 10) || 1);
+      await client.query('UPDATE produits SET stock = stock - $1 WHERE id = $2', [quantiteVoulue, article.id]);
+    }
+
+    await client.query('COMMIT');
+    client.release();
+
     const line_items = articles.map(article => ({
       price_data: {
         currency: 'eur',
@@ -210,6 +248,7 @@ app.post('/create-checkout-session', async (req, res) => {
     });
     res.json({ url: session.url });
   } catch (err) {
+    try { await client.query('ROLLBACK'); client.release(); } catch(e) {}
     console.error('Erreur Stripe :', err.message);
     res.status(500).json({ erreur: 'Impossible de créer la session de paiement.' });
   }
